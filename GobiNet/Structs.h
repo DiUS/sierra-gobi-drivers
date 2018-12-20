@@ -82,6 +82,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <linux/poll.h>
 #include <linux/timer.h>
 #include <linux/proc_fs.h>
+#include <linux/workqueue.h>
 
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION( 2,6,24 ))
    #include "usbnet.h"
@@ -107,9 +108,30 @@ POSSIBILITY OF SUCH DAMAGE.
 #define MAX_RETRY_TASK_LOCK_TIME 10
 #define MAX_RETRY_TASK_MSLEEP_TIME 5
 #define MAX_DEVICE_MEID_SIZE 14
+#define MAX_SVC_VERSION_SIZE 512
+
+//Max number of QMUX supported 
+#define MAX_MUX_NUMBER_SUPPORTED 8
+//First supported QMUX ID
+#define MUX_ID_START 0x80
+//Last supported QMUX ID
+#define MUX_ID_END   MUX_ID_START + MAX_MUX_NUMBER_SUPPORTED
+#define RMNET_QMAP_STRING "rmnet-qmap-"
 
 // Used in recursion, defined later below
 struct sGobiUSBNet;
+
+#define MAX_WQ_PROC_NAME_SIZE 512
+/*=========================================================================*/
+// Struct sGobiPrivateWorkQueues
+//
+//    Structure that defines an entry work queues per deivce
+/*=========================================================================*/
+typedef struct sGobiPrivateWorkQueues{
+   char szProcessName[MAX_WQ_PROC_NAME_SIZE];
+   struct workqueue_struct *wqprobe;
+   struct workqueue_struct *wqProcessReadCallback;
+}sGobiPrivateWorkQueues;
 
 /*=========================================================================*/
 // Struct sReadMemList
@@ -310,6 +332,7 @@ typedef struct sQMIDev
    /* Spinlock for client Memory entries */
    spinlock_t                 mClientMemLock;
    unsigned long              mFlag;
+   struct task_struct         *pTask;
     /* semaphore for Notify */
    struct semaphore           mNotifyMemLock;
 
@@ -354,6 +377,61 @@ typedef struct {
   u32 tx_overflows;
 } sNetStats;
 
+#define IPV6_ADDR_LEN 16
+typedef struct ipv6_addr
+{
+   u8         ipv6addr[IPV6_ADDR_LEN];
+   u8         prefix;
+}__attribute__((__packed__)) ipv6_addr;
+
+
+typedef struct {
+    u8 instance;
+    unsigned int ipAddress;
+    ipv6_addr    ipV6Address;
+} sQMuxIPTable;
+
+typedef struct gobi_qmimux_hdr{
+   u8 pad;
+   u8 mux_id;
+   __be16 pkt_len;
+}gobi_qmimux_hdr;
+
+typedef struct qmap_ipv4_header
+{
+#ifdef LITTLE_ENDIAN
+   unsigned char ihl:4;
+   unsigned char version:4;
+   unsigned char ecn:2;
+   unsigned char dscp:6;
+#else
+   unsigned char version:4;
+   unsigned char ihl:4;
+   unsigned char dscp:6;
+   unsigned char ecn:2;
+#endif
+   unsigned short total_length;
+   unsigned short identification;
+   unsigned short fragment_offset;
+   unsigned char ttl;
+   unsigned char protocol;
+   unsigned short header_checksum;
+   unsigned int src_address;
+   unsigned int dst_address;
+} __attribute__ ((aligned (1))) *qmap_ipv4_header_t;
+
+typedef struct qmap_ipv6_header
+{
+   unsigned int version:4;
+   unsigned int traffic_class:8;
+   unsigned int flow_label:20;
+   unsigned short length;
+   unsigned char next_header;
+   unsigned char hop_limit;
+   unsigned char src_address[16];
+   unsigned char dst_address[16];
+} __attribute__ ((aligned (1))) *qmap_ipv6_header_t;
+
 enum{
    eDataMode_Unknown=-1,
    eDataMode_Ethernet,
@@ -394,12 +472,15 @@ typedef struct sGobiUSBNet
    /* QMI "device" status */
    bool                   mbQMIValid;
    int                   mbUnload;
-
+   int                   mReleaseClientIDFail;
    /* QMI "device" memory */
    sQMIDev                mQMIDev;
 
    /* Device MEID */
    char                   mMEID[MAX_DEVICE_MEID_SIZE];
+
+   /* Service version Info */
+   u8                     svcVersion[MAX_SVC_VERSION_SIZE];
 
    /* AutoPM thread */
    sAutoPM                mAutoPM;
@@ -451,6 +532,32 @@ typedef struct sGobiUSBNet
    u16 WDSClientID;
    int iNetLinkStatus;
    int iDataMode;
+   spinlock_t urb_lock;
+   spinlock_t notif_lock;
+   int iUSBState;
+   int iDeviceMuxID;
+   int iQMUXEnable;
+   int iStoppingNetDev;
+   int nRmnet;
+   int iMaxMuxID;
+   int iPacketInComplete;
+   struct sk_buff *pLastSKB;
+   struct net_device *pNetDevice[MAX_MUX_NUMBER_SUPPORTED];
+   sQMuxIPTable      qMuxIPTable[MAX_MUX_NUMBER_SUPPORTED];
+   u32 ULDatagramSize;
+   u32 ULDatagram;
+   int iIPAlias;
+   /*
+    * Workqueue and Delaywork to probe device.
+    */
+   struct workqueue_struct *wqprobe;
+   struct delayed_work dwprobe;
+   /*
+    * Workqueue and Delaywork to Process Interrupt URB.
+    */
+   struct workqueue_struct *wqProcessReadCallback;
+   struct delayed_work dwProcessReadCallback;
+   struct urb *pReadURB;
 } sGobiUSBNet;
 
 /*=========================================================================*/
@@ -472,5 +579,21 @@ typedef struct sQMIFilpStorage
    struct semaphore       mReleasedSem;
    int                    iIsClosing;
    int                    iReadSyncResult;
+   int                    iInfNum;
+   struct task_struct     *pOpenTask;
+   struct task_struct     *pReadTask;
+   struct task_struct     *pWriteTask;
+   struct task_struct     *pIOCTLTask;
+   int                    iCount;
 } sQMIFilpStorage;
 
+struct gobi_qmimux_priv {
+   struct net_device *real_dev;
+   u8 mux_id;
+};
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION( 3,0,0 )
+#ifndef kstrtol
+#define kstrtol strict_strtol
+#endif
+#endif

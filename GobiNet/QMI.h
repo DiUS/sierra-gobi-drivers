@@ -24,6 +24,7 @@ FUNCTIONS:
       QMIWDSGetPKGSRVCStatusReqSize
       QMIDMSGetMEIDReqSize
       QMICTLSyncReqSize
+      QMICTLGetVersionInfoReqSize
 
    Fill Buffers with QMI requests
       QMICTLGetClientIDReq
@@ -34,6 +35,7 @@ FUNCTIONS:
       QMIDMSGetMEIDReq
       QMICTLSetDataFormatReq
       QMICTLSyncReq
+      QMICTLGetVersionInfoReq
 
    Parse data from QMI responses
       QMICTLGetClientIDResp
@@ -41,6 +43,7 @@ FUNCTIONS:
       QMIWDSEventResp
       QMIDMSGetMEIDResp
       QMICTLSetDataFormatResp
+      QMICTLGetVersionInfoResp
 
 Copyright (c) 2011, Code Aurora Forum. All rights reserved.
 
@@ -103,15 +106,27 @@ POSSIBILITY OF SUCH DAMAGE.
 /*=========================================================================*/
 // Definitions
 /*=========================================================================*/
+#define DEBUG_QMI         1
+#define DEBUG_NETMASK     DEBUG_QMI << 1
 
+extern int netdebug;
 extern int debug;
 extern int qos_debug;
+
 // DBG macro
 #define DBG( format, arg... )\
-if(debug == 1)\
+if(debug & DEBUG_QMI)\
 {\
-      printk( KERN_INFO "GobiNet::%s " format, __FUNCTION__, ## arg ); \
+      printk( KERN_INFO "GobiNet::%s(%d) " format, __FUNCTION__,task_pid_nr(current), ## arg );\
 }
+
+//QMAP DBG macro
+#define NETDBG( format, arg... )\
+if(debug & DEBUG_NETMASK)\
+{\
+      printk( KERN_INFO "GobiNet::%s(%d) " format, __FUNCTION__,task_pid_nr(current), ## arg );\
+}
+
 #define QDBG( format, arg... )\
 if(qos_debug == 1)\
 {\
@@ -178,6 +193,11 @@ if(qos_debug == 1)\
 
 #define MAX_TASK_ID 16
 
+#define QMUX_HEADER_LENGTH 4
+
+#define QMAP_SIZE_OF_RX_BUFFER 32768
+
+#define QMAP_MAX_PADDING_BYTES 64
 //Register State
 enum {
    eStatRegister=0,
@@ -289,13 +309,16 @@ u16 QMIDMSGetMEIDReqSize( void );
 u16 QMIDMSSWISetFCCAuthReqSize( void );
 
 // Get size of buffer needed for QMUX + QMIWDASetDataFormatReq
-u16 QMIWDASetDataFormatReqSize( bool te_flow_control );
+u16 QMIWDASetDataFormatReqSize( int te_flow_control ,int qmuxmode);
 
 // Get size of buffer needed for QMUX + QMICTLSetDataFormatReq
 u16  QMICTLSetDataFormatReqSize( void );
 
 // Get size of buffer needed for QMUX + QMICTLSyncReq
 u16 QMICTLSyncReqSize( void );
+
+// Get size of buffer needed for QMUX + QMICTLGetVersionInfo
+u16 QMICTLGetVersionInfoReqSize( void );
 
 /*=========================================================================*/
 // Fill Buffers with QMI requests
@@ -350,8 +373,10 @@ int QMIWDASetDataFormatReq(
    void *   pBuffer,
    u16      buffSize,
    u16      transactionID,
-   bool     te_flow_control,
-   int      iDataMode);
+   int     te_flow_control,
+   int      iDataMode,
+   unsigned mIntfNum,
+   int      iqmuxenable);
 
 // Fill buffer with QMI CTL Set Data Format Request
 int QMICTLSetDataFormatReq(
@@ -361,6 +386,12 @@ int QMICTLSetDataFormatReq(
    int      iDataMode);
 
 int QMICTLSyncReq(
+   void *pBuffer,
+   u16  buffSize,
+   u16  transactionID );
+
+// Fill buffer with QMI CTL Get version Info Request
+int QMICTLGetVersionInfoReq(
    void *pBuffer,
    u16  buffSize,
    u16  transactionID );
@@ -412,7 +443,9 @@ int QMIDMSGetMEIDResp(
 int QMIWDASetDataFormatResp(
    void *   pBuffer,
    u16      buffSize,
-   int      iDataMode);
+   int      iDataMode,
+   u32 *    ULDatagram,
+   u32 *    ULDatagramSize);
 
 // Parse the QMI Set Data Format Resp
 int QMICTLSetDataFormatResp(
@@ -424,6 +457,13 @@ int QMICTLSetDataFormatResp(
 int QMICTLSyncResp(
    void *pBuffer,
    u16  buffSize );
+
+// Parse the QMI CTL Version Info Response
+int QMICTLGetVersionInfoResp(
+   void *pBuffer,
+   u16   buffSize,
+   u8 *  pSvcVersion,
+   int   versionInfoSize );
 
 // Get size of buffer needed for QMUX + QMICTLSetPowerSaveModeReq
 u16  QMICTLSetPowerSaveModeReqSize( void );
@@ -454,3 +494,25 @@ u16 QMICTLConfigPowerSaveSettingsReqSize( void );
 int QMICTLConfigPowerSaveSettingsResp(
    void *   pBuffer,
    u16      buffSize );
+
+// Get size of buffer needed for QMUX + QMIWDASetDataFormatReqSettingsReq
+u16 QMIWDASetDataFormatReqSettingsSize( void );
+
+int QMIWDASetDataFormatReqSettingsReq(
+      void *   pBuffer,
+      u16      buffSize,
+      u16      transactionID );
+
+void PrintIPAddr(char *msg, unsigned int addr);
+
+enum{
+   eSKIP_TE_FLOW_CONTROL_TLV=-1,
+   eTE_FLOW_CONTROL_TLV_0=0,
+   eTE_FLOW_CONTROL_TLV_1=1,
+};
+
+#define GOBI_GFP_ATOMIC     GFP_ATOMIC|GFP_NOWAIT
+#define GOBI_GFP_KERNEL     GFP_KERNEL|GFP_NOWAIT
+
+void PrintIPV6Addr(ipv6_addr * addr);
+int iIsZeroIPv6Addr(ipv6_addr *pAddr);

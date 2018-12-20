@@ -59,6 +59,7 @@ FUNCTIONS:
       SetupQMIWDSCallback
       QMIDMSGetMEID
       QMIDMSSWISetFCCAuth
+      QMICTLGetVersionInfo
 
 Copyright (c) 2011, Code Aurora Forum. All rights reserved.
 
@@ -128,15 +129,25 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "QMI.h"
 
 #define MAX_QCQMI 255
+#define MAX_QCQMI_PER_INTF 2
 #define SEMI_INIT_DEFAULT_VALUE 0
 #define QMI_CONTROL_MSG_DELAY_MS 100
+#define QMI_CONTROL_MAX_MSG_DELAY_MS QMI_CONTROL_MSG_DELAY_MS * 5
 
 extern int qcqmi_table[MAX_QCQMI];
-
+extern int qmux_table[MAX_QCQMI];
+extern sGobiPrivateWorkQueues GobiPrivateWorkQueues[MAX_QCQMI][MAX_QCQMI_PER_INTF];
 //Register State
 enum {
    eClearCID=0,
-   eClearAndReleaseCID=1
+   eClearAndReleaseCID=1,
+   eForceClearAndReleaseCID=2,
+};
+
+//Work queue type
+enum {
+   eWQ_PROBE=0,
+   eWQ_URBCB=1,
 };
 
 /*=========================================================================*/
@@ -144,7 +155,8 @@ enum {
 /*=========================================================================*/
 
 // Basic test to see if device memory is valid
-bool IsDeviceValid( sGobiUSBNet * pDev );
+
+bool IsDeviceDisconnect(sGobiUSBNet *pDev);
 
 #ifdef CONFIG_PM
 bool bIsSuspend(sGobiUSBNet *pGobiDev);
@@ -154,6 +166,15 @@ void UsbAutopmGetInterface(struct usb_interface * intf);
 
 // Print Hex data, for debug purposes
 void PrintHex(
+   void *         pBuffer,
+   u16            bufSize );
+
+// Print Hex data, for QMAP debug purposes
+void NetHex(
+   void *      pBuffer,
+   u16         bufSize );
+// Print Hex data, for QMAP purposes
+void ErrHex(
    void *         pBuffer,
    u16            bufSize );
 
@@ -177,7 +198,7 @@ bool GobiTestDownReason(
 /*=========================================================================*/
 
 // Resubmit interrupt URB, re-using same values
-int ResubmitIntURB( struct urb * pIntURB );
+int ResubmitIntURB(sGobiUSBNet * pDev, struct urb * pIntURB );
 
 // Read callback
 //    Put the data in storage and notify anyone waiting for data
@@ -186,6 +207,10 @@ void ReadCallback( struct urb * pReadURB );
 // Inturrupt callback
 //    Data is available, start a read URB
 void IntCallback( struct urb * pIntURB );
+
+
+// ReadCallback Intrrupt routine
+void ReadCallbackInt( struct urb * pReadURB );
 
 // Start continuous read "thread"
 int StartRead( sGobiUSBNet * pDev );
@@ -204,7 +229,8 @@ int ReadAsync(
    u16                clientID,
    u16                transactionID,
    void               (*pCallback)(sGobiUSBNet *, u16, void *),
-   void *             pData );
+   void *             pData ,
+   int                iSpinLock);
 
 // Notification function for synchronous read
 void UpSem( 
@@ -235,6 +261,13 @@ int WriteSync(
 
 // Start synchronous write without resume device
 int WriteSyncNoResume(
+   sGobiUSBNet *    pDev,
+   char *             pInWriteBuffer,
+   int                size,
+   u16                clientID );
+
+// Start synchronous write no retry
+int WriteSyncNoRetry(
    sGobiUSBNet *    pDev,
    char *             pInWriteBuffer,
    int                size,
@@ -395,19 +428,20 @@ int QMIDMSGetMEID( sGobiUSBNet * pDev );
 int QMIDMSSWISetFCCAuth( sGobiUSBNet * pDev );
 
 // Register client, send req and parse Data format response, release client
-int QMIWDASetDataFormat( sGobiUSBNet * pDev, bool te_flow_control );
+int QMIWDASetDataFormat( sGobiUSBNet * pDev, int te_flow_control , int iqmuxenable);
+
+// Send set QMAP Data format request and parse response
+int QMIWDASetQMAP( sGobiUSBNet * pDev , u16 WDAClientID);
 
 // send req and parse Data format response
 int QMICTLSetDataFormat( sGobiUSBNet * pDev );
 
+// send req and parse Data format response
+int QMICTLGetVersionInfo( sGobiUSBNet * pDev );
+
 // Initialize Read Sync tasks semaphore
 void InitSemID(sGobiUSBNet * pDev);
 
-//Release all Read Sync tasks semaphore(s)
-void StopSemID(sGobiUSBNet * pDev);
-
-//Query semaphore slot ID
-int iGetSemID(sGobiUSBNet *pDev,int line);
 
 /***************************************************************************/
 // wait_ms
@@ -424,8 +458,7 @@ int UserSpaceLock(struct file *filp, int cmd, struct file_lock *fl);
 void gobi_flush_work(void);
 
 // Close Opened File Inode
-void CloseFileInode(sGobiUSBNet * pDev);
-
+int CloseFileInode(sGobiUSBNet * pDev,int iCount);
 // Set modem in specific power save mode
 int SetPowerSaveMode(sGobiUSBNet *pDev,u8 mode);
 
@@ -437,4 +470,76 @@ u8 QMIXactionIDGet( sGobiUSBNet *pDev);
 
 // Release Specific Client ID Nofitication From Memory List
 int ReleaseNotifyList(sGobiUSBNet *pDev,u16 clientID,u8 transactionID);
+
+int gobi_kthread_should_stop(void);
+
+// 
+int Gobi_usb_control_msg(struct usb_interface *intf, struct usb_device *dev, unsigned int pipe, __u8 request,
+                     __u8 requesttype, __u16 value, __u16 index, void *data,
+                      __u16 size, int timeout);
+
+int AddClientToMemoryList(sGobiUSBNet *pDev,u16 clientID);
+//Wait control message semaphore to be up with timeout
+void wait_control_msg_semaphore_timeout(struct semaphore *pSem, unsigned int timeout);
+
+static inline int IsInterfacefDisconnected(struct usb_interface *intf)
+{
+   if(!interface_to_usbdev(intf))
+      return 1;
+   if (interface_to_usbdev(intf)->state == USB_STATE_NOTATTACHED )
+   {
+      return 1;
+   }
+   return 0;
+}
+
+static inline int gobi_usb_autopm_get_interface(struct usb_interface *intf)
+{
+   if(IsInterfacefDisconnected(intf))
+   {
+      return -ENXIO;
+   }
+   return usb_autopm_get_interface(intf);
+}
+void gobi_usb_autopm_put_interface(struct usb_interface *intf);
+void gobi_usb_autopm_get_interface_no_resume(struct usb_interface *intf);
+int gobi_usb_autopm_get_interface_async(struct usb_interface *intf);
+void gobi_usb_autopm_put_interface_async(struct usb_interface *intf);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION( 2,6,33 ))
+void gobi_usb_autopm_enable(struct usb_interface *intf);
+#endif
+
+//unregister qmap netdev
+void gobi_qmimux_unregister_device(struct net_device *dev);
+//register qmap netdev
+struct net_device * gobi_qmimux_register_device(struct net_device *real_dev,int iNumber, u8 mux_id);
+//Check SKB is a QMUX packet
+int iIsValidQmuxSKB(struct sk_buff *skb);
+//Get MUX ID from skb
+int iGetQmuxIDFromSKB(struct sk_buff *skb);
+//Get Number of QMAP framed Packet In SKB
+int iNumberOfQmuxPacket(struct sk_buff *skb,int iDisplay);
+//Check SKB packet is QMAP framed.
+int iIsQmuxPacketComplete(struct sk_buff *skb);
+//Check NULL QMAP framed packet
+int iIsQmuxZeroPacket(struct sk_buff *skb);
+//Print QMAP Framed packet.
+int PrintQmuxPacket(struct sk_buff *skb);
+//Get QMAP framed packet length.
+u32 u32GetSKBQMAPPacketLength(struct sk_buff *skb,int iOffset);
+//Check QMAP header in SKB.
+int iIsValidQMAPHeaderInSKBData(struct sk_buff *pSKB, int iOffset);
+//Check NULL QMAP header in SKB.
+int iIsZeroQMAPHeaderInSKBData(struct sk_buff *pSKB, int iOffset);
+//Check Command QMAP header in SKB.
+int iIsCMDQMAPHeaderInSKBData(struct sk_buff *pSKB, int iOffset);
+//Remove QMAP header and Padding Bytes
+int iRemoveQMAPPaddingBytes(struct sk_buff *skb);
+
+// Init WorkQueues
+int GobiInitWorkQueue(sGobiUSBNet *pGobiDev);
+// Destory WorkQueues
+void GobiDestoryWorkQueue(sGobiUSBNet *pGobiDev);
+// Clean up work queues in sGobiPrivateWorkQueues
+int iClearWorkQueuesByTableIndex(int index);
 
